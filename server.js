@@ -2,8 +2,10 @@ const http = require("http");
 const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 10000);
-const MAX_HTML = 3 * 1024 * 1024;
-const MAX_PAGES = 200;
+
+const MAX_HTML = 5 * 1024 * 1024;
+const MAX_PAGES = 300;
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 
 function send(res, status, data, contentType = "application/json; charset=utf-8") {
   res.writeHead(status, {
@@ -20,6 +22,10 @@ function send(res, status, data, contentType = "application/json; charset=utf-8"
 function cleanText(text) {
   return String(text || "")
     .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -60,100 +66,186 @@ function validPublicUrl(raw) {
   return u;
 }
 
-async function fetchText(url, timeoutMs = 20000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
   const controller = new AbortController();
-
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
+    return await fetch(url, {
+      ...options,
       signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": "MangaLens/0.1",
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"
-      }
+      redirect: "follow"
     });
-
-    if (!response.ok) {
-      throw new Error(`El sitio respondió HTTP ${response.status}.`);
-    }
-
-    const text = await response.text();
-
-    if (text.length > MAX_HTML) {
-      throw new Error("La página es demasiado grande.");
-    }
-
-    return {
-      response,
-      text
-    };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchText(url) {
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36 MangaLens/1.0",
+      "Accept":
+        "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+      "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`El sitio respondió HTTP ${response.status}.`);
+  }
+
+  const text = await response.text();
+
+  if (text.length > MAX_HTML) {
+    throw new Error("La página es demasiado grande.");
+  }
+
+  return {
+    response,
+    text
+  };
 }
 
 function unique(items) {
   return [...new Set(items.filter(Boolean))];
 }
 
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#47;/gi, "/");
+}
+
+function looksLikeImageUrl(url) {
+  const value = url.toLowerCase();
+
+  if (
+    value.startsWith("data:") ||
+    value.startsWith("blob:") ||
+    value.startsWith("javascript:")
+  ) {
+    return false;
+  }
+
+  return (
+    /\.(jpg|jpeg|png|webp|gif|avif)(?:[?#]|$)/i.test(value) ||
+    /\/(?:image|images|img|uploads|chapter|chapters|pages|manga|comic|comics)\//i.test(
+      value
+    ) ||
+    /(?:image|img|page|chapter|manga|comic)[-_]/i.test(value)
+  );
+}
+
+function addCandidate(list, raw, baseUrl) {
+  if (!raw) return;
+
+  const decoded = decodeHtmlEntities(
+    String(raw).trim()
+  );
+
+  if (!decoded) return;
+
+  const candidates = decoded
+    .split(",")
+    .map(x => x.trim())
+    .map(x => x.split(/\s+/)[0]);
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    try {
+      const imageUrl = new URL(candidate, baseUrl);
+
+      if (
+        (imageUrl.protocol === "http:" ||
+          imageUrl.protocol === "https:") &&
+        !isBlockedHost(imageUrl.hostname) &&
+        looksLikeImageUrl(imageUrl.href)
+      ) {
+        list.push(imageUrl.href);
+      }
+    } catch {}
+  }
+}
+
 function extractImages(html, baseUrl) {
   const images = [];
 
-  const attributeRegex =
-    /<(?:img|source)[^>]+(?:src|data-src|data-original|data-lazy-src|srcset)\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const tagRegex = /<(?:img|source)[^>]*>/gi;
+  let tagMatch;
+
+  while (
+    (tagMatch = tagRegex.exec(html)) &&
+    images.length < MAX_PAGES * 3
+  ) {
+    const tag = tagMatch[0];
+
+    const attrRegex =
+      /\b(?:src|data-src|data-original|data-lazy-src|data-url|data-image|data-original-src|srcset|data-srcset)\s*=\s*["']([^"']+)["']/gi;
+
+    let attrMatch;
+
+    while (
+      (attrMatch = attrRegex.exec(tag)) &&
+      images.length < MAX_PAGES * 3
+    ) {
+      addCandidate(images, attrMatch[1], baseUrl);
+    }
+  }
+
+  const absoluteUrlRegex =
+    /https?:\/\/[^"'\\\s<>]+/gi;
 
   let match;
 
   while (
-    (match = attributeRegex.exec(html)) &&
-    images.length < MAX_PAGES * 2
+    (match = absoluteUrlRegex.exec(html)) &&
+    images.length < MAX_PAGES * 4
   ) {
-    const raw = match[1].trim();
+    const raw = match[0]
+      .replace(/\\u002F/gi, "/")
+      .replace(/\\\//g, "/");
 
-    const candidates = raw
-      .split(",")
-      .map(item => item.trim().split(/\s+/)[0]);
-
-    for (const candidate of candidates) {
-      if (!candidate) continue;
-
-      try {
-        const imageUrl = new URL(candidate, baseUrl);
-
-        if (
-          imageUrl.protocol === "http:" ||
-          imageUrl.protocol === "https:"
-        ) {
-          images.push(imageUrl.href);
-        }
-      } catch {}
+    if (looksLikeImageUrl(raw)) {
+      addCandidate(images, raw, baseUrl);
     }
   }
 
-  const jsonRegex =
-    /["'](https?:\/\/[^"'\\\s]+?\.(?:jpg|jpeg|png|webp|gif)(?:\?[^"'\\\s]*)?)["']/gi;
+  const relativeRegex =
+    /["']([^"']{1,600}(?:\.(?:jpg|jpeg|png|webp|gif|avif))(?:\?[^"']*)?)["']/gi;
 
   while (
-    (match = jsonRegex.exec(html)) &&
-    images.length < MAX_PAGES * 2
+    (match = relativeRegex.exec(html)) &&
+    images.length < MAX_PAGES * 4
   ) {
-    images.push(match[1]);
+    addCandidate(images, match[1], baseUrl);
   }
 
   return unique(images).slice(0, MAX_PAGES);
+}
+
+function findMangaDexChapterId(url) {
+  const match = url.pathname.match(
+    /\/chapter\/([0-9a-f-]{20,})/i
+  );
+
+  return match ? match[1] : null;
 }
 
 async function importMangaDex(chapterId) {
   const api =
     `https://api.mangadex.org/at-home/server/${encodeURIComponent(chapterId)}`;
 
-  const response = await fetch(api, {
+  const response = await fetchWithTimeout(api, {
     headers: {
-      "User-Agent": "MangaLens/0.1",
+      "User-Agent": "MangaLens/1.0",
       "Accept": "application/json"
     }
   });
@@ -177,19 +269,25 @@ async function importMangaDex(chapterId) {
   }
 
   const files =
-    Array.isArray(data.chapter.data) &&
-    data.chapter.data.length
-      ? data.chapter.data
-      : data.chapter.dataSaver || [];
+    Array.isArray(data.chapter.dataSaver) &&
+    data.chapter.dataSaver.length
+      ? data.chapter.dataSaver
+      : data.chapter.data || [];
 
   const mode =
-    data.chapter.data &&
-    data.chapter.data.length
-      ? "data"
-      : "data-saver";
+    Array.isArray(data.chapter.dataSaver) &&
+    data.chapter.dataSaver.length
+      ? "data-saver"
+      : "data";
 
-  const pages = files.map(filename =>
+  const originalPages = files.map(filename =>
     `${data.baseUrl}/${mode}/${data.chapter.hash}/${filename}`
+  );
+
+  const pages = originalPages.map(page =>
+    `/api/image?url=${encodeURIComponent(page)}&ref=${encodeURIComponent(
+      "https://mangadex.org/"
+    )}`
   );
 
   return {
@@ -197,26 +295,18 @@ async function importMangaDex(chapterId) {
     chapterId,
     title:
       data.chapter.title ||
-      `Capítulo ${data.chapter.chapter || ""}`.trim(),
+      `Capítulo ${data.chapter.chapter || ""}`.trim() ||
+      "Capítulo",
     chapter: data.chapter.chapter || "",
     volume: data.chapter.volume || "",
     pages,
-    pageCount: pages.length
+    pageCount: pages.length,
+    mode
   };
-}
-
-function findMangaDexChapterId(url) {
-  const match =
-    url.pathname.match(
-      /\/chapter\/([0-9a-f-]{20,})/i
-    );
-
-  return match ? match[1] : null;
 }
 
 async function importGeneric(rawUrl) {
   const url = validPublicUrl(rawUrl);
-
   const result = await fetchText(url.href);
 
   const finalUrl =
@@ -235,15 +325,21 @@ async function importGeneric(rawUrl) {
       titleMatch ? titleMatch[1] : "Capítulo"
     ) || "Capítulo";
 
+  const pages = images.map(imageUrl =>
+    `/api/image?url=${encodeURIComponent(
+      imageUrl
+    )}&ref=${encodeURIComponent(finalUrl)}`
+  );
+
   return {
     source: "generic",
     title,
     url: finalUrl,
-    pages: images,
-    pageCount: images.length,
+    pages,
+    pageCount: pages.length,
     warning: images.length
-      ? "Se han detectado imágenes públicas en la página."
-      : "No se detectaron imágenes. La web puede cargar el capítulo mediante JavaScript o impedir el acceso automático."
+      ? "Páginas detectadas. MangaLens las servirá mediante su propio backend para mejorar la compatibilidad con WebViewer."
+      : "No se detectaron imágenes públicas. La web puede cargar el capítulo mediante JavaScript o impedir el acceso automático."
   };
 }
 
@@ -251,167 +347,231 @@ async function handleImport(body) {
   const rawUrl = body && body.url;
 
   if (!rawUrl) {
-    throw new Error(
-      "Falta la URL del capítulo."
-    );
+    throw new Error("Falta la URL del capítulo.");
   }
 
-  const url =
-    validPublicUrl(rawUrl);
-
-  const mangaDexId =
-    findMangaDexChapterId(url);
+  const url = validPublicUrl(rawUrl);
+  const mangaDexId = findMangaDexChapterId(url);
 
   if (
-    url.hostname
-      .toLowerCase()
-      .endsWith("mangadex.org") &&
+    url.hostname.toLowerCase().endsWith("mangadex.org") &&
     mangaDexId
   ) {
-    return await importMangaDex(
-      mangaDexId
-    );
+    return await importMangaDex(mangaDexId);
   }
 
-  return await importGeneric(
-    url.href
-  );
+  return await importGeneric(url.href);
 }
 
-const server =
-  http.createServer(
-    async (req, res) => {
+async function proxyImage(req, res, requestUrl) {
+  const rawImageUrl = requestUrl.searchParams.get("url");
+  const rawRef = requestUrl.searchParams.get("ref") || "";
 
-      if (req.method === "OPTIONS") {
-        return send(
-          res,
-          204,
-          ""
-        );
-      }
+  if (!rawImageUrl) {
+    return send(res, 400, {
+      ok: false,
+      error: "Falta la URL de la imagen."
+    });
+  }
 
-      const requestUrl =
-        new URL(
-          req.url,
-          `http://${req.headers.host || "localhost"}`
-        );
+  let imageUrl;
+  let refUrl = null;
 
-      if (
-        requestUrl.pathname === "/health"
-      ) {
-        return send(
-          res,
-          200,
-          {
-            ok: true,
-            service: "MangaLens Backend",
-            version: "0.1"
-          }
-        );
-      }
+  try {
+    imageUrl = validPublicUrl(rawImageUrl);
 
-      if (
-        requestUrl.pathname === "/"
-      ) {
-        return send(
-          res,
-          200,
-          {
-            ok: true,
-            service: "MangaLens Backend",
-            endpoints: [
-              "/health",
-              "/api/import"
-            ]
-          }
-        );
-      }
-
-      if (
-        requestUrl.pathname === "/api/import" &&
-        req.method === "POST"
-      ) {
-
-        let raw = "";
-
-        req.on(
-          "data",
-          chunk => {
-            raw += chunk;
-
-            if (raw.length > 20000) {
-              req.destroy();
-            }
-          }
-        );
-
-        req.on(
-          "end",
-          async () => {
-            try {
-
-              const body =
-                JSON.parse(
-                  raw || "{}"
-                );
-
-              const result =
-                await handleImport(
-                  body
-                );
-
-              send(
-                res,
-                200,
-                {
-                  ok: true,
-                  ...result
-                }
-              );
-
-            } catch (error) {
-
-              console.error(
-                error
-              );
-
-              send(
-                res,
-                400,
-                {
-                  ok: false,
-                  error:
-                    error &&
-                    error.message
-                      ? error.message
-                      : "No se pudo importar el capítulo."
-                }
-              );
-            }
-          }
-        );
-
-        return;
-      }
-
-      send(
-        res,
-        404,
-        {
-          ok: false,
-          error:
-            "Ruta no encontrada."
-        }
-      );
+    if (rawRef) {
+      try {
+        refUrl = validPublicUrl(rawRef);
+      } catch {}
     }
-  );
+  } catch (error) {
+    return send(res, 400, {
+      ok: false,
+      error: error.message
+    });
+  }
+
+  try {
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36 MangaLens/1.0",
+      "Accept":
+        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    };
+
+    if (refUrl) {
+      headers.Referer = refUrl.href;
+      headers.Origin = `${refUrl.protocol}//${refUrl.host}`;
+    }
+
+    const response = await fetchWithTimeout(
+      imageUrl.href,
+      { headers },
+      30000
+    );
+
+    if (!response.ok) {
+      return send(res, response.status, {
+        ok: false,
+        error:
+          `La imagen respondió HTTP ${response.status}.`
+      });
+    }
+
+    const contentType =
+      response.headers.get("content-type") ||
+      "application/octet-stream";
+
+    if (
+      !contentType.startsWith("image/") &&
+      !contentType.includes("octet-stream")
+    ) {
+      return send(res, 415, {
+        ok: false,
+        error:
+          "La fuente no devolvió una imagen."
+      });
+    }
+
+    const contentLength =
+      Number(
+        response.headers.get("content-length") || 0
+      );
+
+    if (contentLength > MAX_IMAGE_BYTES) {
+      return send(res, 413, {
+        ok: false,
+        error: "La imagen es demasiado grande."
+      });
+    }
+
+    const buffer = Buffer.from(
+      await response.arrayBuffer()
+    );
+
+    if (buffer.length > MAX_IMAGE_BYTES) {
+      return send(res, 413, {
+        ok: false,
+        error: "La imagen es demasiado grande."
+      });
+    }
+
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Content-Length": buffer.length,
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600"
+    });
+
+    res.end(buffer);
+  } catch (error) {
+    console.error("IMAGE_PROXY_ERROR", error);
+
+    send(res, 502, {
+      ok: false,
+      error:
+        "No se pudo obtener la imagen desde la fuente."
+    });
+  }
+}
+
+const server = http.createServer(
+  async (req, res) => {
+    if (req.method === "OPTIONS") {
+      return send(res, 204, "");
+    }
+
+    const requestUrl = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    );
+
+    if (requestUrl.pathname === "/health") {
+      return send(res, 200, {
+        ok: true,
+        service: "MangaLens Backend",
+        version: "0.2",
+        imageProxy: true
+      });
+    }
+
+    if (requestUrl.pathname === "/") {
+      return send(res, 200, {
+        ok: true,
+        service: "MangaLens Backend",
+        version: "0.2",
+        endpoints: [
+          "/health",
+          "/api/import",
+          "/api/image"
+        ]
+      });
+    }
+
+    if (
+      requestUrl.pathname === "/api/image" &&
+      req.method === "GET"
+    ) {
+      return proxyImage(req, res, requestUrl);
+    }
+
+    if (
+      requestUrl.pathname === "/api/import" &&
+      req.method === "POST"
+    ) {
+      let raw = "";
+      let tooLarge = false;
+
+      req.on("data", chunk => {
+        raw += chunk;
+
+        if (raw.length > 30000) {
+          tooLarge = true;
+          req.destroy();
+        }
+      });
+
+      req.on("end", async () => {
+        if (tooLarge) return;
+
+        try {
+          const body = JSON.parse(raw || "{}");
+          const result = await handleImport(body);
+
+          send(res, 200, {
+            ok: true,
+            ...result
+          });
+        } catch (error) {
+          console.error("IMPORT_ERROR", error);
+
+          send(res, 400, {
+            ok: false,
+            error:
+              error && error.message
+                ? error.message
+                : "No se pudo importar el capítulo."
+          });
+        }
+      });
+
+      return;
+    }
+
+    send(res, 404, {
+      ok: false,
+      error: "Ruta no encontrada."
+    });
+  }
+);
 
 server.listen(
   PORT,
   "0.0.0.0",
   () => {
     console.log(
-      `MangaLens Backend escuchando en 0.0.0.0:${PORT}`
+      `MangaLens Backend 0.2 escuchando en 0.0.0.0:${PORT}`
     );
   }
 );
